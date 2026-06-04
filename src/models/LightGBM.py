@@ -30,6 +30,7 @@ class LightGBMModel(BaseModel):
         self.train_start = pd.to_datetime(config['data']['train']['start']).tz_localize('UTC')
         self.val_start = pd.to_datetime(config['data']['val']['start']).tz_localize('UTC')
         self.test_start = pd.to_datetime(config['data']['test']['start']).tz_localize('UTC')
+        self.test_end = pd.to_datetime(config['data']['test']['end']).tz_localize('UTC')
 
     # ─────────── 训练 ───────────
 
@@ -74,52 +75,68 @@ class LightGBMModel(BaseModel):
 
     # ─────────── 交叉验证 ───────────
 
-    def cross_validate(self, df_full: pd.DataFrame) -> pd.DataFrame:
-        if self.model is None:
-            raise RuntimeError("模型未训练，请先调用 fit()")
+    def cross_validate(self, df_full: pd.DataFrame):
+        """滑动窗口交叉验证。
+
+        模型只训练一次（不存在则自动调用 fit()），
+        然后在测试集上以 prediction_window 为窗口大小、步长 1h 滑动预测。
+        """
+        # 如果还没训练，先训练
+        if self.model is None or not hasattr(self.model, 'booster_') or self.model.booster_ is None:
+            print("模型未训练，自动调用 fit()...")
+            self.fit(df_full)
 
         df = df_full.sort_values(self.time_col).reset_index(drop=True)
 
-        # 取测试集部分（不重新训练，直接用 fit() 训练好的模型）
-        test = df[df[self.time_col] >= self.test_start].copy()
-
-        # 在测试集上预测
-        y_pred = self.model.predict(test[self.feature_cols])
-
-        cv_results = pd.DataFrame({
-            "ds": test[self.time_col].values,
-            "y": test[self.target_col].values,
-            self.model_name: y_pred,
-        })
-
-        # 按天切分窗口（和 NeuralForecast 行为一致）
-        cv_results['ds'] = pd.to_datetime(cv_results['ds'])
-
-        local_tz = self.config['data']['feature_kwargs']['local_tz']
         prediction_window = self.config['data']['prediction_window']
-        start_hour = int(self.config['data'].get('insured_time', '0'))
+        local_tz = self.config['data']['feature_kwargs']['local_tz']
 
-        cv_results['ds_local'] = cv_results['ds'].dt.tz_convert(local_tz)
+        # 测试集（严格按配置的时间范围）
+        test_df = df[(df[self.time_col] >= self.test_start) & (df[self.time_col] <= self.test_end)].copy()
+        test_df = test_df.reset_index(drop=True)
 
-        # 筛选每天从指定小时开始的窗口
-        valid_cutoffs = (
-            cv_results
-            .groupby(cv_results['ds_local'].dt.date)['ds_local']
-            .min()
-            .loc[lambda s: s.dt.hour == start_hour]
-            .index
-        )
+        # 找到每天 0 点作为窗口起点
+        test_df['ds_local'] = test_df[self.time_col].dt.tz_convert(local_tz)
+        midnight_mask = test_df['ds_local'].dt.hour == 0
+        start_indices = test_df.index[midnight_mask].tolist()
 
-        cv_selected = (
-            cv_results[cv_results['ds_local'].dt.date.isin(valid_cutoffs)]
-            .groupby(cv_results['ds_local'].dt.date)
-            .tail(prediction_window)
-        )
+        total = len(start_indices)
+        print(f"滑动窗口预测: {total} 个窗口（每天 0 点开始，步长 1h，窗口大小 {prediction_window}h）")
 
-        cv_selected["begin_utc"] = cv_selected.groupby(cv_results['ds_local'].dt.date)["ds"].transform("first")
-        cv_selected = cv_selected.drop(columns=["ds_local"]).reset_index(drop=True)
+        all_rows = []
+        for idx, start_idx in enumerate(start_indices):
+            end_idx = start_idx + prediction_window
+            if end_idx > len(test_df):
+                break
 
-        return cv_selected
+            window = test_df.iloc[start_idx:end_idx]
+            y_pred = self.model.predict(window[self.feature_cols])
+            window_start = window[self.time_col].iloc[0]  # 窗口起点（当天 0 点）
+
+            for j, (_, row) in enumerate(window.iterrows()):
+                all_rows.append({
+                    "ds": row[self.time_col],
+                    "y": row[self.target_col],
+                    self.model_name: y_pred[j],
+                    "cutoff": window_start,
+                })
+
+            if (idx + 1) % max(1, total // 10) == 0 or idx == total - 1:
+                print(f"  进度: {idx + 1}/{total}")
+
+        cv_results = pd.DataFrame(all_rows)
+        if cv_results.empty:
+            print("警告: 没有产生任何窗口")
+            return cv_results
+
+        cv_results['ds'] = pd.to_datetime(cv_results['ds'])
+        cv_results['cutoff'] = pd.to_datetime(cv_results['cutoff'])
+        cv_selected = cv_results.copy()
+        cv_selected["begin_utc"] = cv_selected.groupby("cutoff")["ds"].transform("first")
+        cv_selected = cv_selected.drop(columns=["cutoff"])
+
+        return cv_selected.reset_index(drop=True)
+
 
     # ─────────── 保存 / 加载 ───────────
 
