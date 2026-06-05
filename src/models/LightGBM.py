@@ -89,6 +89,7 @@ class LightGBMModel(BaseModel):
         df = df_full.sort_values(self.time_col).reset_index(drop=True)
 
         prediction_window = self.config['data']['prediction_window']
+        horizon_total = self.config.get('horizon_total', prediction_window)  # test.py 设置为了 1080
         local_tz = self.config['data']['feature_kwargs']['local_tz']
 
         # 测试集（严格按配置的时间范围）
@@ -99,18 +100,21 @@ class LightGBMModel(BaseModel):
         test_df['ds_local'] = test_df[self.time_col].dt.tz_convert(local_tz)
         midnight_mask = test_df['ds_local'].dt.hour == 0
         start_indices = test_df.index[midnight_mask].tolist()
-
+        
         total = len(start_indices)
-        print(f"滑动窗口预测: {total} 个窗口（每天 0 点开始，步长 1h，窗口大小 {prediction_window}h）")
+        print(f"滑动窗口预测: {total} 个窗口（每天 0 点开始，窗口大小 {prediction_window}h，输入 {horizon_total}h）")
 
         all_rows = []
         for idx, start_idx in enumerate(start_indices):
-            end_idx = start_idx + prediction_window
+            end_idx = start_idx + horizon_total  # 取 1080 条输入
             if end_idx > len(test_df):
                 break
 
             window = test_df.iloc[start_idx:end_idx]
             y_pred = self.model.predict(window[self.feature_cols])
+            # 只保留后 prediction_window 条（1056）
+            y_pred = y_pred[-prediction_window:]
+            window = window.tail(prediction_window)
             window_start = window[self.time_col].iloc[0]  # 窗口起点（当天 0 点）
 
             for j, (_, row) in enumerate(window.iterrows()):
